@@ -2091,6 +2091,7 @@ def compare_context_objects(newconf, running):
     seglist_to_del = []
     pceconf_to_del = []
     pcclist_to_del = []
+    vrf_to_del = []
     candidates_to_add = []
     delete_bgpd = False
     area_stub_no_sum = r"area (\S+) stub no-summary"
@@ -2127,7 +2128,7 @@ def compare_context_objects(newconf, running):
                 delete_bgpd = True
                 lines_to_del.append((running_ctx_keys, None))
 
-            # We cannot do 'no interface' or 'no vrf' in FRR, and so deal with it
+            # We cannot do 'no interface' in FRR, and so deal with it
             # If we try 'no interface' for still active interface, FRR tries to delete it and fails.
             # All commands under 'interface' section MUST support 'no' commands and exit silently
             # without errors if interface is deleted
@@ -2138,6 +2139,33 @@ def compare_context_objects(newconf, running):
             ):
                 for line in running_ctx.lines:
                     lines_to_del.append((running_ctx_keys, line))
+
+                # Emptying the stanza is not enough for a vrf: the YANG node
+                # outlives its last line, so 'show running-config' keeps
+                # printing an empty "vrf NAME / exit-vrf" block and every
+                # reload that churns vrfs leaves another one behind.
+                # 'no vrf NAME' used to be refused while the kernel device was
+                # up, which is why this only emptied the stanza; since
+                # a703920aa9 ("lib: unconfigure user VRFs in lib_vrf_destroy
+                # without vrf_delete") it clears VRF_CONFIGURED and leaves a
+                # kernel-backed vrf object in place, so it is safe to issue.
+                if (
+                    running_ctx_keys[0].startswith("vrf ")
+                    and len(running_ctx_keys) == 1
+                ):
+                    vrf_parts = running_ctx_keys[0].split(None, 1)
+                    vrf_name = vrf_parts[1].strip() if len(vrf_parts) > 1 else ""
+
+                    # The default vrf cannot be deleted, and under the vrf-lite
+                    # backend 'no vrf NAME' also destroys the matching
+                    # 'interface NAME' node -- keep the stanza rather than drop
+                    # interface config the new file still asks for.
+                    if (
+                        vrf_name
+                        and vrf_name != "default"
+                        and ("interface %s" % vrf_name,) not in newconf.contexts
+                    ):
+                        vrf_to_del.append((running_ctx_keys, None))
 
             # If this is an address-family under 'router bgp' and we are already deleting the
             # entire 'router bgp' context then ignore this sub-context
@@ -2288,6 +2316,11 @@ def compare_context_objects(newconf, running):
     # if we have some pcc list commands to delete, append them to lines_to_del
     if len(pcclist_to_del) > 0:
         lines_to_del.extend(pcclist_to_del)
+
+    # vrf deletions go last: by now everything that referenced the vrf has been
+    # removed, so 'no vrf NAME' has only the empty stanza left to drop.
+    if len(vrf_to_del) > 0:
+        lines_to_del.extend(vrf_to_del)
 
     # Find the lines within each context to add
     # Find the lines within each context to del
